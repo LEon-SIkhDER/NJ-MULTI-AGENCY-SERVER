@@ -26,7 +26,10 @@ const shareLinkToImageUrl = async (shareLink: string) => {
 }
 
 
-const uri = `mongodb+srv://${process.env.DB_USERNAME}:${process.env.DB_PASSWORD}@cluster0.7hhwads.mongodb.net/?appName=Cluster0`;
+const uri = process.env.URI;
+if (!uri) {
+    throw new Error("URI is not defined in environment variables")
+}
 // const uri = `mongodb+srv://Nj_Multi_Agency:fcLuV987C3VNybQR@cluster0.7hhwads.mongodb.net/?appName=Cluster0`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -37,6 +40,19 @@ const client = new MongoClient(uri, {
         deprecationErrors: true,
     }
 });
+const fakeDataAboutPitcher = {
+    totalClientsHandled: 0,
+    successRate: 0,
+    avgClientPerDay: 0,
+    successfullyHandledClient: 0,
+    activePitches: 0,
+    // totalClientsHandled: 128,
+    // successRate: 80,
+    // avgClientPerDay: 4.2,
+    // successfullyHandledClient: 102,
+    // activePitches: 6,
+    // status: "active"
+}
 
 async function run() {
     try {
@@ -46,11 +62,37 @@ async function run() {
 
 
         // user ______________________
+        app.get("/users", async (req, res) => {
+            const { search } = req.query
+            let query = { role: "user" }
+            if (search) {
+                const searchQuery = {
+                    $or: [
+                        { name: { $regex: search, $options: "i" } },
+                        { email: { $regex: search, $options: "i" } }
+                    ]
+                }
+                query = { ...query, ...searchQuery }
+
+            }
+            const result = await usersCollection.find(query).toArray()
+            res.send(result)
+        })
         app.post("/users", async (req, res) => {
             const user = req.body
             user.createdAt = new Date()
             user.updatedAt = new Date()
             user.role = "user"
+            // Check if user already exists
+            const existingUser = await usersCollection.findOne({ uid: user.uid })
+
+            if (existingUser) {
+                return res.send({
+                    message: "User already exists",
+                    user: existingUser
+                })
+            }
+
             const result = await usersCollection.insertOne(user)
             res.send(result)
         })
@@ -59,18 +101,49 @@ async function run() {
             const { id } = req.params
             const query = { _id: new ObjectId(id) }
             const result = await pitchersCollection.findOne(query)
-            res.send(result)
+
+            res.send(result ? { ...result, ...fakeDataAboutPitcher } : result)
         })
         app.get("/pitchers", async (req, res) => {
-            const result = await pitchersCollection.find().toArray()
-            res.send(result)
+            const result = await pitchersCollection.find().sort({ _id: -1 }).toArray()
+            const fakeResult = result.map((singleResult) => ({ ...singleResult, ...fakeDataAboutPitcher }))
+            res.send(fakeResult)
         })
+
         app.post("/pitcher", async (req, res) => {
             const pitcher = req.body
             pitcher.createdAt = new Date()
             pitcher.updatedAt = new Date()
             pitcher.role = "pitcher"
+            pitcher.status = 'active'
+            await usersCollection.updateOne({ uid: pitcher.uid }, { $set: { role: pitcher.role } })
             const result = await pitchersCollection.insertOne(pitcher)
+            res.send(result)
+        })
+
+        app.patch("/pitcher/:id", async (req, res) => {
+            const { id } = req.params
+            const status = req.body
+            const update = {
+                $set: status
+            }
+            const query = { _id: new ObjectId(id) }
+            const result = await pitchersCollection.updateOne(query, update)
+            res.send(result)
+
+        })
+
+        app.delete("/pitcher/:uid", async (req, res) => {
+            const uid = req.params
+            await usersCollection.updateOne(uid, { $set: { role: "user" } })
+            const result = await pitchersCollection.deleteOne(uid)
+            res.send(result)
+        })
+
+        app.get("/role", async (req, res) => {
+            const email = req.query
+            const projection = { projection: { _id: 0, role: 1 } }
+            const result = await usersCollection.findOne(email, projection)
             res.send(result)
         })
 
