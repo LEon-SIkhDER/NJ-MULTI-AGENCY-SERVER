@@ -133,15 +133,13 @@ app.use((req, res, next) => {
     next();
 });
 
-if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
-    try {
-        dns.setServers([
-            "8.8.8.8",
-            "1.1.1.1"
-        ]);
-    } catch (e: any) {
-        console.warn("DNS setServers warning:", e.message);
-    }
+try {
+    dns.setServers([
+        "8.8.8.8",
+        "1.1.1.1"
+    ]);
+} catch (e: any) {
+    console.warn("DNS setServers warning:", e.message);
 }
 
 

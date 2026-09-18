@@ -128,16 +128,14 @@ app.use((req, res, next) => {
     }
     next();
 });
-if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
-    try {
-        node_dns_1.default.setServers([
-            "8.8.8.8",
-            "1.1.1.1"
-        ]);
-    }
-    catch (e) {
-        console.warn("DNS setServers warning:", e.message);
-    }
+try {
+    node_dns_1.default.setServers([
+        "8.8.8.8",
+        "1.1.1.1"
+    ]);
+}
+catch (e) {
+    console.warn("DNS setServers warning:", e.message);
 }
 const shareLinkToImageUrl = async (shareLink) => {
     const { url } = await fetch(shareLink, { redirect: "follow" });
