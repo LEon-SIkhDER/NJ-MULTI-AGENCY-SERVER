@@ -105,12 +105,20 @@ app.use(cors())
 app.use(express.json())
 const port = process.env.PORT || 5000;
 
+// URL normalization for Vercel rewrites (/api -> /)
+app.use((req, _res, next) => {
+    if (req.url.startsWith('/api')) {
+        req.url = req.url.replace(/^\/api/, '') || '/';
+    }
+    next();
+});
+
 let isShutdown = false;
 
 // Emergency Kill Switch Middleware
 app.use((req, res, next) => {
     // Whitelist root test route and kill_switch API endpoints
-    if (req.path === '/' || req.path.startsWith('/kill_switch')) {
+    if (req.path === '/' || req.path === '/api' || req.path.startsWith('/kill_switch')) {
         return next();
     }
 
@@ -144,25 +152,28 @@ const shareLinkToImageUrl = async (shareLink: string) => {
     return profileImage
 }
 app.get('/', async (req: Request, res: Response) => {
-    // console.log()
+    res.send('Hello World!');
+});
+app.get('/api', async (req: Request, res: Response) => {
     res.send('Hello World!');
 });
 
 
-const uri = process.env.URI;
+const uri = process.env.URI || "";
 if (!uri) {
-    throw new Error("URI is not defined in environment variables")
+    console.warn("WARNING: URI is not defined in environment variables. Make sure URI is configured in Vercel Project Settings > Environment Variables.");
 }
-// const uri = `mongodb+srv://Nj_Multi_Agency:fcLuV987C3VNybQR@cluster0.7hhwads.mongodb.net/?appName=Cluster0`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
-const client = new MongoClient(uri, {
-    serverApi: {
-        version: ServerApiVersion.v1,
-        strict: true,
-        deprecationErrors: true,
-    }
-});
+const client = uri
+    ? new MongoClient(uri, {
+        serverApi: {
+            version: ServerApiVersion.v1,
+            strict: true,
+            deprecationErrors: true,
+        }
+    })
+    : null;
 // all handled in my entire life 
 
 
@@ -171,6 +182,10 @@ const client = new MongoClient(uri, {
 // console.log(new Date("2026-09-05"))
 
 async function run() {
+    if (!client) {
+        console.warn("MongoDB client is not initialized because URI is missing.");
+        return;
+    }
     try {
         const database = client.db("Nj_Multi_Agency")
         const usersCollection = database.collection("users")
@@ -1278,3 +1293,4 @@ if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
 }
 
 export default app;
+module.exports = app;
