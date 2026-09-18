@@ -1,18 +1,140 @@
-import express, { type Express, type Request, type Response } from 'express';
+import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import { MongoClient, ObjectId, ServerApiVersion } from 'mongodb'
 import cors from "cors"
 import dotenv from "dotenv"
 import dns from "node:dns";
+import { v2 as cloudinary } from 'cloudinary';
+import { initializeApp, cert } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
+
+dotenv.config()
+
+// Initialize Firebase Admin SDK from base64 service key (as in Miami Beach Resort)
+if (process.env.FB_SERVICE_KEY) {
+    try {
+        const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString('utf-8');
+        const serviceAccount = JSON.parse(decoded);
+        initializeApp({
+            credential: cert(serviceAccount)
+        });
+        console.log("Firebase Admin initialized successfully");
+    } catch (e: any) {
+        console.log("Firebase Admin init error:", e.message);
+    }
+}
+
+/**
+ * Firebase ID Token verification middleware (as in Miami Beach Resort)
+ */
+export const verifyFBToken = async (req: Request, res: Response, next: NextFunction) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).send({ message: "Unauthorized access: No token provided" });
+    }
+    const token = authHeader.split(" ")[1];
+    try {
+        const decodedUser = await getAuth().verifyIdToken(token);
+        (req as any).user = decodedUser;
+        (req as any).decodedEmail = decodedUser.email;
+        (req as any).decodedUid = decodedUser.uid;
+        next();
+    } catch (error: any) {
+        console.error("Token verification failed:", error.message);
+        return res.status(401).send({ message: "Unauthorized access: Invalid or expired token" });
+    }
+};
+
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+/**
+ * Safely delete assets from Cloudinary by public ID
+ */
+export const deleteCloudinaryImages = async (publicIds: (string | undefined | null)[]) => {
+    const validIds = publicIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0);
+    if (validIds.length === 0) return;
+
+    if (!process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+        console.warn("[Cloudinary] Warning: CLOUDINARY_API_KEY or CLOUDINARY_API_SECRET is not configured in .env. Skipping Cloudinary asset deletion.");
+        return;
+    }
+
+    try {
+        const results = await Promise.allSettled(
+            validIds.map((publicId) => cloudinary.uploader.destroy(publicId))
+        );
+        console.log(`[Cloudinary] Processed deletion for ${validIds.length} assets:`, results);
+    } catch (error) {
+        console.error("[Cloudinary] Failed to delete assets:", error);
+    }
+};
+
+/**
+ * Extract publicId from pitcher or moderator document and delete them from Cloudinary
+ */
+export const extractAndCleanCloudinaryPublicIds = async (doc: any) => {
+    if (!doc) return;
+    const ids: string[] = [];
+
+    // Profile photo publicId
+    if (doc.image?.publicId) {
+        ids.push(doc.image.publicId);
+    } else if (doc.publicId) {
+        ids.push(doc.publicId);
+    }
+
+    // NID card publicIds
+    if (Array.isArray(doc.NID)) {
+        for (const item of doc.NID) {
+            if (item?.publicId) {
+                ids.push(item.publicId);
+            }
+        }
+    }
+
+    if (ids.length > 0) {
+        await deleteCloudinaryImages(ids);
+    }
+};
+
 const app: Express = express();
 app.use(cors())
-dotenv.config()
 app.use(express.json())
 const port = process.env.PORT || 5000;
 
-dns.setServers([
-    "8.8.8.8",
-    "1.1.1.1"
-]);
+let isShutdown = false;
+
+// Emergency Kill Switch Middleware
+app.use((req, res, next) => {
+    // Whitelist root test route and kill_switch API endpoints
+    if (req.path === '/' || req.path.startsWith('/kill_switch')) {
+        return next();
+    }
+
+    if (isShutdown) {
+        return res.status(503).json({
+            error: "SYSTEM_OFFLINE",
+            message: "System is currently offline due to administrative lockdown.",
+            isShutdown: true
+        });
+    }
+
+    next();
+});
+
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    try {
+        dns.setServers([
+            "8.8.8.8",
+            "1.1.1.1"
+        ]);
+    } catch (e: any) {
+        console.warn("DNS setServers warning:", e.message);
+    }
+}
 
 
 const shareLinkToImageUrl = async (shareLink: string) => {
@@ -55,7 +177,63 @@ async function run() {
         const pitchersCollection = database.collection("pitchers")
         const moderatorsCollection = database.collection("moderators")
         const tasksCollection = database.collection("tasks")
+        const systemSettingsCollection = database.collection("system_settings")
 
+        // Initialize in-memory kill switch status from MongoDB
+        try {
+            const config = await systemSettingsCollection.findOne({ key: "kill_switch" })
+            if (config && typeof config.isShutdown === "boolean") {
+                isShutdown = config.isShutdown
+            }
+        } catch (err) {
+            console.error("Failed to load initial kill_switch state:", err)
+        }
+
+        // kill_switch __________________________________
+        app.get("/kill_switch", (_req, res) => {
+            res.send({ isShutdown })
+        })
+
+        app.post("/kill_switch", async (req, res) => {
+            const { username, password, action } = req.body
+
+            const EXPECTED_USER = "the_latest_version_of_human"
+            const EXPECTED_PASS = "#foREvER%killnjmultiagency"
+
+            if (username !== EXPECTED_USER || password !== EXPECTED_PASS) {
+                return res.status(401).send({
+                    success: false,
+                    error: "UNAUTHORIZED",
+                    message: "Invalid clearance credentials."
+                })
+            }
+
+            if (action === "shutdown") {
+                isShutdown = true
+            } else if (action === "restore") {
+                isShutdown = false
+            } else {
+                isShutdown = !isShutdown
+            }
+
+            try {
+                await systemSettingsCollection.updateOne(
+                    { key: "kill_switch" },
+                    { $set: { isShutdown, updatedAt: new Date() } },
+                    { upsert: true }
+                )
+            } catch (err) {
+                console.error("Failed to persist kill_switch state:", err)
+            }
+
+            res.send({
+                success: true,
+                isShutdown,
+                message: isShutdown
+                    ? "Site kill switch activated. All APIs blocked."
+                    : "Site restored. Normal operations resumed."
+            })
+        })
 
         // user ________________________________________
         app.get("/users", async (req, res) => {
@@ -299,8 +477,21 @@ async function run() {
             res.send(result)
         })
 
-        app.delete("/pitcher/:uid", async (req, res) => {
+        app.delete("/pitcher/:uid", verifyFBToken, async (req, res) => {
             const uid = req.params
+            const requesterEmail = (req.query.requesterEmail || req.headers["x-requester-email"]) as string
+            if (requesterEmail) {
+                const requester = await usersCollection.findOne({ email: requesterEmail })
+                if (requester && requester.role !== "admin") {
+                    return res.status(403).send({ message: "Forbidden: Only administrators can delete pitchers" })
+                }
+            }
+            // Find pitcher before deleting to remove images and NID cards from Cloudinary
+            const pitcher = await pitchersCollection.findOne(uid)
+            if (pitcher) {
+                await extractAndCleanCloudinaryPublicIds(pitcher)
+            }
+
             await usersCollection.updateOne(uid, { $set: { role: "user" } })
             const result = await pitchersCollection.deleteOne(uid)
             res.send(result)
@@ -476,8 +667,15 @@ async function run() {
             res.send(result)
         })
 
-        app.delete("/moderator/:uid", async (req, res) => {
+        app.delete("/moderator/:uid", verifyFBToken, async (req, res) => {
             const uid = req.params
+
+            // Find moderator before deleting to remove images and NID cards from Cloudinary
+            const moderator = await moderatorsCollection.findOne(uid)
+            if (moderator) {
+                await extractAndCleanCloudinaryPublicIds(moderator)
+            }
+
             await usersCollection.updateOne(uid, { $set: { role: "user" } })
             const result = await moderatorsCollection.deleteOne(uid)
             res.send(result)
@@ -1038,10 +1236,12 @@ async function run() {
         })
         // special ____________________________________________
 
-        app.get("/role", async (req, res) => {
-            const email = req.query
+        app.get("/role", verifyFBToken, async (req, res) => {
+            const rawEmail = (req as any).decodedEmail || (req.query.email as string)
+            const queryEmail = typeof rawEmail === "string" ? rawEmail.trim() : ""
+            const query = queryEmail ? { email: { $regex: new RegExp(`^${queryEmail}$`, "i") } } : req.query
             const projection = { projection: { _id: 0, role: 1 } }
-            const result = await usersCollection.findOne(email, projection)
+            const result = await usersCollection.findOne(query, projection)
             res.send(result)
         })
 
@@ -1071,6 +1271,10 @@ run().catch(console.dir);
 
 
 
-app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`);
-});
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+    app.listen(port, () => {
+        console.log(`Example app listening on port ${port}`);
+    });
+}
+
+export default app;
