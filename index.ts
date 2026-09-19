@@ -1,5 +1,5 @@
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
-import { MongoClient, ObjectId, ServerApiVersion } from 'mongodb'
+import { MongoClient, ObjectId, ServerApiVersion, type Collection, type Document } from 'mongodb'
 import cors from "cors"
 import dotenv from "dotenv"
 import dns from "node:dns";
@@ -51,9 +51,9 @@ cloudinary.config({
 });
 
 /**
- * Safely delete assets from Cloudinary by public ID
+ * Safely delete assets from Cloudinary by public ID in the background (fire-and-forget)
  */
-export const deleteCloudinaryImages = async (publicIds: (string | undefined | null)[]) => {
+export const deleteCloudinaryImages = (publicIds: (string | undefined | null)[]) => {
     const validIds = publicIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0);
     if (validIds.length === 0) return;
 
@@ -62,20 +62,21 @@ export const deleteCloudinaryImages = async (publicIds: (string | undefined | nu
         return;
     }
 
-    try {
-        const results = await Promise.allSettled(
-            validIds.map((publicId) => cloudinary.uploader.destroy(publicId))
-        );
-        console.log(`[Cloudinary] Processed deletion for ${validIds.length} assets:`, results);
-    } catch (error) {
-        console.error("[Cloudinary] Failed to delete assets:", error);
-    }
+    Promise.allSettled(
+        validIds.map((publicId) => cloudinary.uploader.destroy(publicId))
+    )
+        .then((results) => {
+            console.log(`[Cloudinary] Background deletion processed for ${validIds.length} assets:`, results);
+        })
+        .catch((error) => {
+            console.error("[Cloudinary] Failed to delete assets in background:", error);
+        });
 };
 
 /**
- * Extract publicId from pitcher or moderator document and delete them from Cloudinary
+ * Extract publicId from pitcher or moderator document and delete them from Cloudinary in the background
  */
-export const extractAndCleanCloudinaryPublicIds = async (doc: any) => {
+export const extractAndCleanCloudinaryPublicIds = (doc: any) => {
     if (!doc) return;
     const ids: string[] = [];
 
@@ -93,10 +94,12 @@ export const extractAndCleanCloudinaryPublicIds = async (doc: any) => {
                 ids.push(item.publicId);
             }
         }
+    } else if (doc.NID?.publicId) {
+        ids.push(doc.NID.publicId);
     }
 
     if (ids.length > 0) {
-        await deleteCloudinaryImages(ids);
+        deleteCloudinaryImages(ids);
     }
 };
 
@@ -133,13 +136,17 @@ app.use((req, res, next) => {
     next();
 });
 
-try {
-    dns.setServers([
-        "8.8.8.8",
-        "1.1.1.1"
-    ]);
-} catch (e: any) {
-    console.warn("DNS setServers warning:", e.message);
+// Set DNS servers only for local development environments where SRV lookup may fail.
+// Do not override DNS in Vercel / AWS Lambda environments as it interferes with cloud VPC resolvers.
+if (!process.env.VERCEL) {
+    try {
+        dns.setServers([
+            "8.8.8.8",
+            "1.1.1.1"
+        ]);
+    } catch (e: any) {
+        console.warn("DNS setServers warning:", e.message);
+    }
 }
 
 
@@ -162,45 +169,114 @@ if (!uri) {
     console.warn("WARNING: URI is not defined in environment variables. Make sure URI is configured in Vercel Project Settings > Environment Variables.");
 }
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
-const client = uri
-    ? new MongoClient(uri, {
-        serverApi: {
-            version: ServerApiVersion.v1,
-            strict: true,
-            deprecationErrors: true,
+const clientOptions = {
+    serverApi: {
+        version: ServerApiVersion.v1,
+        strict: true,
+        deprecationErrors: true,
+    },
+    maxPoolSize: 10,
+    minPoolSize: 0,
+    maxIdleTimeMS: 30000,
+    serverSelectionTimeoutMS: 10000,
+    socketTimeoutMS: 45000,
+    connectTimeoutMS: 10000,
+};
+
+let cachedClient: MongoClient | null = (global as any)._mongoClient || null;
+let clientPromise: Promise<MongoClient> | null = (global as any)._mongoClientPromise || null;
+
+export async function getClient(): Promise<MongoClient> {
+    if (!uri) {
+        throw new Error("MongoDB URI is not defined in environment variables. Make sure URI is configured in Vercel.");
+    }
+
+    const topology = (cachedClient as any)?.topology;
+    const isTopologyDead = !cachedClient || !topology || topology.isDestroyed?.() || topology.s?.state === 'closed';
+
+    if (cachedClient && !isTopologyDead) {
+        return cachedClient;
+    }
+
+    if (!clientPromise || isTopologyDead) {
+        const client = new MongoClient(uri, clientOptions);
+        client.on('topologyClosed', () => {
+            console.warn("[MongoDB] Topology closed. Clearing cached client for reconnection.");
+            if (cachedClient === client) {
+                cachedClient = null;
+                clientPromise = null;
+                (global as any)._mongoClient = null;
+                (global as any)._mongoClientPromise = null;
+            }
+        });
+
+        clientPromise = client.connect().then((c) => {
+            cachedClient = c;
+            (global as any)._mongoClient = c;
+            (global as any)._mongoClientPromise = clientPromise;
+            return c;
+        }).catch((err) => {
+            cachedClient = null;
+            clientPromise = null;
+            (global as any)._mongoClient = null;
+            (global as any)._mongoClientPromise = null;
+            throw err;
+        });
+    }
+
+    return clientPromise;
+}
+
+function getCollection<T extends Document = any>(name: string): Collection<T> {
+    return new Proxy({} as Collection<T>, {
+        get(_target, prop, receiver) {
+            if (!cachedClient) {
+                throw new Error(`MongoDB client is not connected yet. Collection '${name}' accessed before database initialization.`);
+            }
+            const col = cachedClient.db("Nj_Multi_Agency").collection<T>(name);
+            const val = Reflect.get(col, prop, receiver);
+            return typeof val === 'function' ? val.bind(col) : val;
         }
-    })
-    : null;
-// all handled in my entire life 
+    });
+}
 
+const usersCollection = getCollection("users");
+const pitchersCollection = getCollection("pitchers");
+const moderatorsCollection = getCollection("moderators");
+const tasksCollection = getCollection("tasks");
+const systemSettingsCollection = getCollection("system_settings");
 
-
-
-// console.log(new Date("2026-09-05"))
-
-async function run() {
-    if (!client) {
-        console.warn("MongoDB client is not initialized because URI is missing.");
-        return;
+// Database connection verification middleware for Express in Serverless
+app.use(async (req, res, next) => {
+    if (req.path === '/' || req.path === '/api') {
+        return next();
     }
     try {
-        const database = client.db("Nj_Multi_Agency")
-        const usersCollection = database.collection("users")
-        const pitchersCollection = database.collection("pitchers")
-        const moderatorsCollection = database.collection("moderators")
-        const tasksCollection = database.collection("tasks")
-        const systemSettingsCollection = database.collection("system_settings")
+        await getClient();
+        next();
+    } catch (error: any) {
+        console.error("MongoDB connection error on request:", error);
+        return res.status(500).json({
+            error: "DATABASE_CONNECTION_ERROR",
+            message: "Unable to connect to MongoDB. Please check MongoDB Atlas IP whitelist (allow 0.0.0.0/0 for Vercel) and database credentials.",
+            details: error?.message
+        });
+    }
+});
 
-        // Initialize in-memory kill switch status from MongoDB
-        try {
-            const config = await systemSettingsCollection.findOne({ key: "kill_switch" })
-            if (config && typeof config.isShutdown === "boolean") {
-                isShutdown = config.isShutdown
-            }
-        } catch (err) {
-            console.error("Failed to load initial kill_switch state:", err)
+// Initialize in-memory kill switch status from MongoDB on startup
+(async function initKillSwitch() {
+    try {
+        await getClient();
+        const config = await systemSettingsCollection.findOne({ key: "kill_switch" });
+        if (config && typeof config.isShutdown === "boolean") {
+            isShutdown = config.isShutdown;
         }
+        console.log("Pinged your deployment. You successfully connected to MongoDB!");
+    } catch (err: any) {
+        console.error("Failed to load initial kill_switch state:", err.message);
+    }
+})();
 
         // kill_switch __________________________________
         app.get("/kill_switch", (_req, res) => {
@@ -499,10 +575,10 @@ async function run() {
                     return res.status(403).send({ message: "Forbidden: Only administrators can delete pitchers" })
                 }
             }
-            // Find pitcher before deleting to remove images and NID cards from Cloudinary
+            // Clean up images and NID cards from Cloudinary in background (non-blocking)
             const pitcher = await pitchersCollection.findOne(uid)
             if (pitcher) {
-                await extractAndCleanCloudinaryPublicIds(pitcher)
+                extractAndCleanCloudinaryPublicIds(pitcher)
             }
 
             await usersCollection.updateOne(uid, { $set: { role: "user" } })
@@ -683,10 +759,10 @@ async function run() {
         app.delete("/moderator/:uid", verifyFBToken, async (req, res) => {
             const uid = req.params
 
-            // Find moderator before deleting to remove images and NID cards from Cloudinary
+            // Clean up images and NID cards from Cloudinary in background (non-blocking)
             const moderator = await moderatorsCollection.findOne(uid)
             if (moderator) {
-                await extractAndCleanCloudinaryPublicIds(moderator)
+                extractAndCleanCloudinaryPublicIds(moderator)
             }
 
             await usersCollection.updateOne(uid, { $set: { role: "user" } })
@@ -1266,13 +1342,6 @@ async function run() {
 
 
 
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
-    } finally {
-        // Ensures that the client will close when you finish/error
-        // await client.close();
-    }
-}
-run().catch(console.dir);
 
 
 
@@ -1289,6 +1358,13 @@ if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
         console.log(`Example app listening on port ${port}`);
     });
 }
+
+Object.assign(app, {
+    getClient,
+    deleteCloudinaryImages,
+    extractAndCleanCloudinaryPublicIds,
+    verifyFBToken
+});
 
 export default app;
 module.exports = app;
